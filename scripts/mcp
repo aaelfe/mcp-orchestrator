@@ -1,0 +1,594 @@
+#!/bin/bash
+# scripts/mcp - MCP Orchestrator CLI
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+CONFIG_FILE="$PROJECT_DIR/mcp-config.json"
+COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+NGINX_CONF="$PROJECT_DIR/nginx.conf"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() { echo -e "${BLUE}ℹ${NC} $1"; }
+log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
+log_error() { echo -e "${RED}✗${NC} $1"; }
+
+check_requirements() {
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker is not installed. Please install Docker first."
+        exit 1
+    fi
+    
+    if ! command -v docker-compose &> /dev/null; then
+        log_error "Docker Compose is not installed. Please install Docker Compose first."
+        exit 1
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        log_error "jq is not installed. Please install jq first."
+        log_info "Install with: brew install jq (macOS) or apt-get install jq (Ubuntu)"
+        exit 1
+    fi
+}
+
+ensure_config_exists() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log_info "Creating initial mcp-config.json..."
+        cat > "$CONFIG_FILE" << 'EOF'
+{
+  "mcpServers": {}
+}
+EOF
+        log_success "Created mcp-config.json"
+    fi
+}
+
+list_mcps() {
+    ensure_config_exists
+    
+    log_info "Configured MCP servers:"
+    echo
+    
+    if [ "$(jq '.mcpServers | length' "$CONFIG_FILE")" -eq 0 ]; then
+        echo "  No MCP servers configured yet."
+        echo
+        log_info "Add servers with: ./scripts/mcp add <name> <command> [args...]"
+        log_info "Example: ./scripts/mcp add github npx @modelcontextprotocol/server-github"
+        return
+    fi
+    
+    jq -r '.mcpServers | to_entries[] | "  \(.key): \(.value.command) \(.value.args // [] | join(" "))"' "$CONFIG_FILE"
+    echo
+    log_info "Edit mcp-config.json directly for advanced configuration"
+    log_info "Run './scripts/mcp restart' after changes"
+}
+
+add_mcp() {
+    local name="$1"
+    local command="$2"
+    shift 2
+    local args=("$@")
+    
+    if [ -z "$name" ] || [ -z "$command" ]; then
+        log_error "Usage: ./scripts/mcp add <name> <command> [args...]"
+        echo
+        echo "Examples:"
+        echo "  ./scripts/mcp add github npx @modelcontextprotocol/server-github"
+        echo "  ./scripts/mcp add filesystem mcp-server-filesystem --read-only"
+        echo "  ./scripts/mcp add postgres npx @modelcontextprotocol/server-postgres"
+        exit 1
+    fi
+    
+    ensure_config_exists
+    
+    # Build JSON for the new server
+    local server_config="{\"command\": \"$command\""
+    
+    if [ ${#args[@]} -gt 0 ]; then
+        local args_json=$(printf '%s\n' "${args[@]}" | jq -R . | jq -s .)
+        server_config="$server_config, \"args\": $args_json"
+    fi
+    
+    server_config="$server_config}"
+    
+    # Add to config
+    jq ".mcpServers[\"$name\"] = $server_config" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    
+    log_success "Added MCP server: $name"
+    log_info "Run './scripts/mcp restart' to apply changes"
+    
+    # Show environment variable suggestions
+    suggest_env_vars "$name" "$command"
+}
+
+remove_mcp() {
+    local name="$1"
+    
+    if [ -z "$name" ]; then
+        log_error "Usage: ./scripts/mcp remove <name>"
+        exit 1
+    fi
+    
+    ensure_config_exists
+    
+    if ! jq -e ".mcpServers[\"$name\"]" "$CONFIG_FILE" > /dev/null; then
+        log_error "MCP server '$name' not found"
+        return 1
+    fi
+    
+    jq "del(.mcpServers[\"$name\"])" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    
+    log_success "Removed MCP server: $name"
+    log_info "Run './scripts/mcp restart' to apply changes"
+}
+
+suggest_env_vars() {
+    local name="$1"
+    local command="$2"
+    
+    case "$command" in
+        *"server-github"*)
+            log_info "💡 For GitHub MCP, add to .env: GITHUB_TOKEN=ghp_xxxxxxxxxxxx"
+            ;;
+        *"server-slack"*)
+            log_info "💡 For Slack MCP, add to .env: SLACK_BOT_TOKEN=xoxb-xxxxxxxxxxxx"
+            ;;
+        *"server-postgres"*)
+            log_info "💡 For Postgres MCP, add to .env: POSTGRES_CONNECTION_STRING=postgresql://..."
+            ;;
+        *"server-brave-search"*)
+            log_info "💡 For Brave Search MCP, add to .env: BRAVE_API_KEY=your_api_key"
+            ;;
+    esac
+}
+
+generate_docker_compose() {
+    ensure_config_exists
+    
+    log_info "Generating docker-compose.yml from mcp-config.json..."
+    
+    # Start with base compose file
+    cat > "$COMPOSE_FILE" << 'EOF'
+version: '3.8'
+
+services:
+  # Reverse proxy for MCP routing
+  proxy:
+    image: nginx:alpine
+    container_name: mcp-proxy
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
+  # Cloudflare tunnel for secure access
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: mcp-tunnel
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared-config.yml:/etc/cloudflared/config.yml:ro
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - proxy
+
+EOF
+
+    # Add MCP services
+    jq -r '.mcpServers | to_entries[] | @base64' "$CONFIG_FILE" | while read -r entry; do
+        local decoded=$(echo "$entry" | base64 --decode)
+        local name=$(echo "$decoded" | jq -r '.key')
+        local command=$(echo "$decoded" | jq -r '.value.command')
+        local args=$(echo "$decoded" | jq -r '.value.args // [] | join(" ")')
+        
+        cat >> "$COMPOSE_FILE" << EOF
+  # MCP Server: $name
+  mcp-$name:
+    image: node:18-alpine
+    container_name: mcp-$name
+    working_dir: /app
+    command: sh -c "npm install -g $command && $command $args"
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - \${HOME}:/workspace:ro
+
+EOF
+    done
+    
+    log_success "Generated docker-compose.yml"
+}
+
+generate_nginx_config() {
+    ensure_config_exists
+    
+    log_info "Generating nginx.conf from mcp-config.json..."
+    
+    # Start with base config
+    cat > "$NGINX_CONF" << 'EOF'
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream mcp_backend {
+EOF
+
+    # Add upstream servers
+    jq -r '.mcpServers | keys[]' "$CONFIG_FILE" | while read -r name; do
+        echo "        server mcp-$name:8080;" >> "$NGINX_CONF"
+    done
+    
+    # Add fallback if no servers
+    if [ "$(jq '.mcpServers | length' "$CONFIG_FILE")" -eq 0 ]; then
+        echo "        server 127.0.0.1:9999;  # Placeholder" >> "$NGINX_CONF"
+    fi
+    
+    cat >> "$NGINX_CONF" << 'EOF'
+    }
+
+    server {
+        listen 80;
+        
+        # Health check endpoint
+        location /health {
+            return 200 'MCP Orchestrator OK';
+            add_header Content-Type text/plain;
+        }
+
+        # MCP Server-Sent Events endpoint
+        location /mcp/ {
+            proxy_pass http://mcp_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_cache_bypass $http_upgrade;
+            
+            # SSE specific settings
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 24h;
+            proxy_send_timeout 24h;
+        }
+
+        # API endpoint for server list
+        location /api/servers {
+            return 200 '{"servers": "dynamic"}';
+            add_header Content-Type application/json;
+        }
+
+        # Status page
+        location / {
+            return 200 '<!DOCTYPE html>
+<html>
+<head><title>MCP Orchestrator</title></head>
+<body>
+<h1>🚀 MCP Orchestrator</h1>
+<p>Your Model Context Protocol infrastructure is running!</p>
+<ul>
+<li><a href="/health">Health Check</a></li>
+<li><a href="/mcp/">MCP Endpoint</a></li>
+</ul>
+</body>
+</html>';
+            add_header Content-Type text/html;
+        }
+    }
+}
+EOF
+    
+    log_success "Generated nginx.conf"
+}
+
+start_services() {
+    log_info "Starting MCP Orchestrator..."
+    
+    # Load environment variables
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
+    else
+        log_warning "No .env file found. Copy .env.example to .env and configure."
+    fi
+    
+    # Check tunnel token
+    if [ -z "${TUNNEL_TOKEN}" ]; then
+        log_error "TUNNEL_TOKEN not set in .env file"
+        log_info "1. Create Cloudflare tunnel: cloudflared tunnel create mcp-orchestrator"
+        log_info "2. Copy tunnel token to .env file"
+        exit 1
+    fi
+    
+    # Generate configs
+    generate_docker_compose
+    generate_nginx_config
+    
+    cd "$PROJECT_DIR"
+    docker-compose up -d
+    
+    log_success "MCP Orchestrator started"
+    log_info "Access your hub at: https://${TUNNEL_DOMAIN:-your-domain.com}"
+}
+
+stop_services() {
+    log_info "Stopping MCP Orchestrator..."
+    cd "$PROJECT_DIR"
+    docker-compose down
+    log_success "MCP Orchestrator stopped"
+}
+
+restart_services() {
+    log_info "Restarting MCP Orchestrator..."
+    
+    # Regenerate configs
+    generate_docker_compose
+    generate_nginx_config
+    
+    cd "$PROJECT_DIR"
+    docker-compose down
+    docker-compose up -d
+    log_success "MCP Orchestrator restarted"
+}
+
+status_services() {
+    log_info "MCP Orchestrator status:"
+    cd "$PROJECT_DIR"
+    docker-compose ps
+}
+
+show_logs() {
+    local service="$1"
+    cd "$PROJECT_DIR"
+    
+    if [ -n "$service" ]; then
+        docker-compose logs -f "$service"
+    else
+        docker-compose logs -f
+    fi
+}
+
+show_config() {
+    ensure_config_exists
+    
+    log_info "Current MCP configuration:"
+    echo
+    cat "$CONFIG_FILE" | jq .
+    echo
+    log_info "Edit mcp-config.json directly for advanced configuration"
+    log_info "Run './scripts/mcp restart' after changes"
+}
+
+create_env_file() {
+    local env_file="$PROJECT_DIR/.env"
+    
+    if [ -f "$env_file" ]; then
+        log_warning ".env file already exists. Skipping creation."
+        return
+    fi
+    
+    log_info "Creating .env file..."
+    
+    # Create base .env file
+    cat > "$env_file" << 'EOF'
+# MCP Orchestrator Environment Variables
+# Generated on $(date)
+
+# Cloudflare Tunnel Configuration
+TUNNEL_TOKEN=
+TUNNEL_DOMAIN=
+
+# MCP Server Tokens
+GITHUB_TOKEN=
+SLACK_BOT_TOKEN=
+POSTGRES_CONNECTION_STRING=
+BRAVE_API_KEY=
+EOF
+    
+    log_success "Created .env file"
+    
+    # Prompt for Cloudflare tunnel setup
+    log_info "Let's set up your Cloudflare tunnel..."
+    read -p "Do you want to set up Cloudflare tunnel now? (y/n) " setup_tunnel
+    
+    if [ "$setup_tunnel" = "y" ]; then
+        if ! command -v cloudflared &> /dev/null; then
+            log_error "cloudflared CLI not installed"
+            log_info "Install from: https://github.com/cloudflare/cloudflared"
+            log_info "You can set up the tunnel later with: ./scripts/mcp setup-tunnel"
+        else
+            log_info "Creating Cloudflare tunnel..."
+            cloudflared tunnel create mcp-orchestrator
+            
+            log_info "Please enter your domain (e.g., mcp.yourdomain.com):"
+            read -p "Domain: " domain
+            
+            if [ -n "$domain" ]; then
+                cloudflared tunnel route dns mcp-orchestrator "$domain"
+                sed -i '' "s/TUNNEL_DOMAIN=/TUNNEL_DOMAIN=$domain/" "$env_file"
+            fi
+            
+            log_info "Please enter your tunnel token from Cloudflare dashboard:"
+            read -p "Tunnel Token: " token
+            
+            if [ -n "$token" ]; then
+                sed -i '' "s/TUNNEL_TOKEN=/TUNNEL_TOKEN=$token/" "$env_file"
+            fi
+        fi
+    fi
+    
+    # Prompt for MCP server tokens
+    log_info "Let's set up your MCP server tokens..."
+    
+    read -p "Do you want to set up GitHub integration? (y/n) " setup_github
+    if [ "$setup_github" = "y" ]; then
+        read -p "Enter your GitHub token: " github_token
+        if [ -n "$github_token" ]; then
+            sed -i '' "s/GITHUB_TOKEN=/GITHUB_TOKEN=$github_token/" "$env_file"
+        fi
+    fi
+    
+    read -p "Do you want to set up Slack integration? (y/n) " setup_slack
+    if [ "$setup_slack" = "y" ]; then
+        read -p "Enter your Slack bot token: " slack_token
+        if [ -n "$slack_token" ]; then
+            sed -i '' "s/SLACK_BOT_TOKEN=/SLACK_BOT_TOKEN=$slack_token/" "$env_file"
+        fi
+    fi
+    
+    read -p "Do you want to set up PostgreSQL integration? (y/n) " setup_postgres
+    if [ "$setup_postgres" = "y" ]; then
+        read -p "Enter your PostgreSQL connection string: " postgres_conn
+        if [ -n "$postgres_conn" ]; then
+            sed -i '' "s/POSTGRES_CONNECTION_STRING=/POSTGRES_CONNECTION_STRING=$postgres_conn/" "$env_file"
+        fi
+    fi
+    
+    read -p "Do you want to set up Brave Search integration? (y/n) " setup_brave
+    if [ "$setup_brave" = "y" ]; then
+        read -p "Enter your Brave API key: " brave_key
+        if [ -n "$brave_key" ]; then
+            sed -i '' "s/BRAVE_API_KEY=/BRAVE_API_KEY=$brave_key/" "$env_file"
+        fi
+    fi
+    
+    log_success "Environment setup complete!"
+    log_info "You can edit .env file later to add or modify tokens"
+}
+
+init_example() {
+    ensure_config_exists
+    create_env_file
+    
+    log_info "Adding example MCP servers to get you started..."
+    
+    # Add filesystem server
+    jq '.mcpServers["filesystem"] = {
+        "command": "npx",
+        "args": ["@modelcontextprotocol/server-filesystem", "/workspace"]
+    }' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    
+    log_success "Added example servers to mcp-config.json"
+    log_info "Edit mcp-config.json to add more servers or modify configuration"
+    log_info "Run './scripts/mcp restart' when ready"
+}
+
+setup_tunnel() {
+    log_info "Setting up Cloudflare tunnel..."
+    
+    if ! command -v cloudflared &> /dev/null; then
+        log_error "cloudflared CLI not installed"
+        log_info "Install from: https://github.com/cloudflare/cloudflared"
+        exit 1
+    fi
+    
+    log_info "1. Create a new tunnel:"
+    echo "   cloudflared tunnel create mcp-orchestrator"
+    echo
+    log_info "2. Configure DNS (replace with your domain):"
+    echo "   cloudflared tunnel route dns mcp-orchestrator mcp.yourdomain.com"
+    echo
+    log_info "3. Get your tunnel token from Cloudflare dashboard"
+    log_info "4. Add TUNNEL_TOKEN to your .env file"
+    echo
+    log_info "For detailed setup instructions, see: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/"
+}
+
+show_help() {
+    echo "MCP Orchestrator CLI"
+    echo
+    echo "Usage: $0 <command> [options]"
+    echo
+    echo "Commands:"
+    echo "  list                    List configured MCP servers"
+    echo "  add <name> <cmd> [args] Add an MCP server"
+    echo "  remove <name>           Remove an MCP server"
+    echo "  config                  Show current configuration"
+    echo "  init                    Add example servers"
+    echo "  start                   Start all services"
+    echo "  stop                    Stop all services"
+    echo "  restart                 Restart all services"
+    echo "  status                  Show service status"
+    echo "  logs [service]          Show logs"
+    echo "  setup-tunnel            Show Cloudflare tunnel setup"
+    echo "  help                    Show this help message"
+    echo
+    echo "Examples:"
+    echo "  $0 init                                    # Add example servers"
+    echo "  $0 add github npx @modelcontextprotocol/server-github"
+    echo "  $0 add postgres npx @modelcontextprotocol/server-postgres"
+    echo "  $0 restart                                 # Apply changes"
+    echo "  $0 logs mcp-github                         # Show GitHub MCP logs"
+}
+
+# Main command handling
+case "${1:-help}" in
+    "list"|"ls")
+        list_mcps
+        ;;
+    "add")
+        check_requirements
+        shift
+        add_mcp "$@"
+        ;;
+    "remove"|"rm")
+        check_requirements
+        remove_mcp "$2"
+        ;;
+    "config"|"show")
+        show_config
+        ;;
+    "init")
+        check_requirements
+        init_example
+        ;;
+    "start"|"up")
+        check_requirements
+        start_services
+        ;;
+    "stop"|"down")
+        check_requirements
+        stop_services
+        ;;
+    "restart")
+        check_requirements
+        restart_services
+        ;;
+    "status"|"ps")
+        check_requirements
+        status_services
+        ;;
+    "logs")
+        check_requirements
+        show_logs "$2"
+        ;;
+    "setup-tunnel")
+        setup_tunnel
+        ;;
+    "help"|"-h"|"--help")
+        show_help
+        ;;
+    *)
+        log_error "Unknown command: $1"
+        echo
+        show_help
+        exit 1
+        ;;
+esac
