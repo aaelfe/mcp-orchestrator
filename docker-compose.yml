@@ -1,0 +1,38 @@
+services:
+  # Reverse proxy for MCP routing
+  proxy:
+    image: nginx:alpine
+    container_name: mcp-proxy
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
+  # Cloudflare tunnel for secure access
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: mcp-tunnel
+    command: tunnel run
+    volumes:
+      - ${HOME}/.cloudflared:/etc/cloudflared:ro
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - proxy
+
+  # MCP Server: filesystem
+  mcp-filesystem:
+    image: node:18-alpine
+    container_name: mcp-filesystem
+    working_dir: /app
+    command: sh -c "npm install -g npx && npx @modelcontextprotocol/server-filesystem /workspace"
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ${HOME}:/workspace:ro
+
