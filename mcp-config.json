@@ -6,6 +6,12 @@
         "@modelcontextprotocol/server-filesystem",
         "/workspace"
       ]
+    },
+    "github": {
+      "command": "npx",
+      "args": [
+        "@modelcontextprotocol/server-github"
+      ]
     }
   }
 }

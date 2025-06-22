@@ -196,10 +196,10 @@ EOF
         cat >> "$COMPOSE_FILE" << EOF
   # MCP Server: $name
   mcp-$name:
-    image: node:18-alpine
+    image: node:20-alpine
     container_name: mcp-$name
     working_dir: /app
-    command: sh -c "npm install -g $command && $command $args"
+    command: sh -c "$command $args"
     environment:
       - NODE_ENV=production
     env_file:
@@ -414,22 +414,52 @@ EOF
             log_info "Install from: https://github.com/cloudflare/cloudflared"
             log_info "You can set up the tunnel later with: ./scripts/mcp setup-tunnel"
         else
+            # Check if user is logged in to Cloudflare
+            if ! cloudflared tunnel list &> /dev/null; then
+                log_info "You need to log in to Cloudflare first..."
+                cloudflared tunnel login
+            fi
+            
             log_info "Creating Cloudflare tunnel..."
-            cloudflared tunnel create mcp-orchestrator
+            tunnel_output=$(cloudflared tunnel create mcp-orchestrator)
+            tunnel_id=$(echo "$tunnel_output" | grep -o '[a-f0-9-]\{36\}')
+            
+            if [ -z "$tunnel_id" ]; then
+                log_error "Failed to create tunnel. Please check your Cloudflare credentials."
+                exit 1
+            fi
+            
+            log_info "Tunnel created with ID: $tunnel_id"
             
             log_info "Please enter your domain (e.g., mcp.yourdomain.com):"
             read -p "Domain: " domain
             
             if [ -n "$domain" ]; then
+                # Configure DNS
                 cloudflared tunnel route dns mcp-orchestrator "$domain"
                 sed -i '' "s/TUNNEL_DOMAIN=/TUNNEL_DOMAIN=$domain/" "$env_file"
-            fi
-            
-            log_info "Please enter your tunnel token from Cloudflare dashboard:"
-            read -p "Tunnel Token: " token
-            
-            if [ -n "$token" ]; then
-                sed -i '' "s/TUNNEL_TOKEN=/TUNNEL_TOKEN=$token/" "$env_file"
+                
+                # Create local tunnel configuration file for the project
+                cat > "$PROJECT_DIR/cloudflared-config.yml" << EOF
+tunnel: $tunnel_id
+credentials-file: /root/.cloudflared/$tunnel_id.json
+ingress:
+  - hostname: $domain
+    service: http://proxy:80
+  - service: http_status:404
+EOF
+                
+                # Get tunnel token
+                tunnel_token=$(cloudflared tunnel token "$tunnel_id")
+                if [ -n "$tunnel_token" ]; then
+                    sed -i '' "s/TUNNEL_TOKEN=/TUNNEL_TOKEN=$tunnel_token/" "$env_file"
+                fi
+                
+                log_success "Tunnel configured for domain: $domain"
+                log_info "Configuration saved to cloudflared-config.yml"
+                log_info "Make sure your domain's nameservers are pointing to Cloudflare"
+            else
+                log_warning "No domain provided. You'll need to configure DNS routing later."
             fi
         fi
     fi
