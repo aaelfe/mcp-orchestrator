@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   # Reverse proxy for MCP routing
   proxy:
@@ -13,9 +15,9 @@ services:
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: mcp-tunnel
-    command: tunnel run
+    command: tunnel --config /etc/cloudflared/config.yml run
     volumes:
-      - ${HOME}/.cloudflared:/etc/cloudflared:ro
+      - ./cloudflared-config.yml:/etc/cloudflared/config.yml:ro
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN}
     restart: unless-stopped
@@ -24,10 +26,24 @@ services:
 
   # MCP Server: filesystem
   mcp-filesystem:
-    image: node:18-alpine
+    image: node:20-alpine
     container_name: mcp-filesystem
     working_dir: /app
-    command: sh -c "npm install -g npx && npx @modelcontextprotocol/server-filesystem /workspace"
+    command: sh -c "npx @modelcontextprotocol/server-filesystem /workspace"
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ${HOME}:/workspace:ro
+
+  # MCP Server: github
+  mcp-github:
+    image: node:20-alpine
+    container_name: mcp-github
+    working_dir: /app
+    command: sh -c "npx @modelcontextprotocol/server-github"
     environment:
       - NODE_ENV=production
     env_file:
