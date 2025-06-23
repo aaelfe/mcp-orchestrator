@@ -1,0 +1,38 @@
+{
+  "name": "mcp-orchestrator",
+  "version": "1.0.0",
+  "description": "🚀 MCP Orchestrator Easy self-hosting for Model Context Protocol (MCP) servers with secure remote access. MCP Orchestrator lets you deploy and manage multiple MCP servers in one place, accessible remotely via Cloudflare tunnels. Perfect for developers who want to use MCP tools like filesystem access, GitHub integration, and more from anywhere. ✨ Features",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "dev": "ts-node src/example.ts",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clean": "rm -rf dist"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aaelfe/mcp-orchestrator.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/aaelfe/mcp-orchestrator/issues"
+  },
+  "homepage": "https://github.com/aaelfe/mcp-orchestrator#readme",
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.3",
+    "@types/ws": "^8.18.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "ws": "^8.18.2"
+  }
+}
