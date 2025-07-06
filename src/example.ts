@@ -45,26 +45,18 @@ async function demonstrateTransportLayer() {
       }
     ),
 
-    // WebSocket transport for real-time MCP server
-    createTransportConfig.websocket(
+    // Mock WebSocket transport for real-time MCP server (using stdio for demo)
+    createTransportConfig.stdio(
       'realtime-mcp',
-      'wss://realtime.example.com/mcp',
-      {
-        protocols: ['mcp-v1'],
-        reconnectInterval: 5000,
-        maxReconnectAttempts: 10,
-        pingInterval: 30000
-      }
+      'echo',
+      ['{"jsonrpc":"2.0","id":1,"result":{"resources":[]}}']
     ),
 
-    // SSE transport for streaming MCP server
-    createTransportConfig.sse(
+    // Mock SSE transport for streaming MCP server (using stdio for demo)
+    createTransportConfig.stdio(
       'streaming-mcp',
-      'https://stream.example.com/events',
-      {
-        reconnectInterval: 3000,
-        maxReconnectAttempts: 5
-      }
+      'echo',
+      ['{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}']
     )
   ];
 
@@ -289,10 +281,11 @@ async function advancedUsageExamples() {
         pool: { maxInstances: 2, minInstances: 1, healthCheckInterval: 15000, restartOnFailure: true }
       },
       {
-        type: 'websocket' as const,
+        type: 'stdio' as const,
         id: 'dynamic-ws',
-        url: 'wss://dynamic.example.com/mcp',
-        reconnectInterval: 3000
+        image: 'node:20-alpine',
+        command: ['echo', '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'],
+        pool: { maxInstances: 1, minInstances: 1, healthCheckInterval: 15000, restartOnFailure: true }
       }
     ]
   };
@@ -307,12 +300,6 @@ async function advancedUsageExamples() {
           config.image,
           config.command,
           { pool: config.pool }
-        );
-      } else if (config.type === 'websocket') {
-        transportConfig = createTransportConfig.websocket(
-          config.id,
-          config.url,
-          { reconnectInterval: config.reconnectInterval }
         );
       }
       
